@@ -1,0 +1,116 @@
+#!/bin/sh
+# =======================================================================
+# Basic Vaultron lifecycle functionality tests
+# NB: This only properly tests a default OSS cluster with Consul storage.
+#
+# 1.  Test ./unform
+# 2.  Test ./form
+# 3.  Test Terraform state presence
+# 4.  Test Consul server data directories presence after forming
+# 5.  Test Terraform configuration directory presence after forming
+# 6.  Test Terraform init, plan, apply log output presence after forming
+# 7.  Test Blazing Sword convenience script
+# 8.  Test ./unform
+# 9.  Test Terraform state presence after unforming
+# 10. Test Consul server data directories presence after unforming
+# 11. Test Terraform configuration directory presence after unforming
+# 12. Test Terraform init, plan, apply log output presence after unforming
+# =======================================================================
+
+# shellcheck disable=SC1091,SC1117
+
+export txtblu="\033[0;34m" # Blue
+export txtgrn="\033[0;32m" # Green
+export txtred="\033[0;31m" # Red
+export txtylw="\033[0;33m" # Yellow
+export txtwht="\033[0;37m" # White
+export txtrst="\033[0m"    # Text Reset
+
+export CONSUL_HTTP_ADDR="localhost:8500"
+export VAULT_ADDR="https://localhost:9200"
+
+if ! ./unform; then
+    echo "[e] Error unforming any previous Vaultron."
+    exit 1
+fi
+
+if ! ./form; then
+    echo "${txtred}[e] Error forming Vaultron!${txtrst}"
+    exit 1
+fi
+
+for i in 0 1 2; do
+    if ! [ -d "./flavors/consul/consul/consuls$i" ]; then
+        echo "${txtred}[e] Missing directory consul/consuls$i after forming!${txtrst}";
+        exit 1
+    fi
+    if ! [ -d "./flavors/consul/consul/consulc$i" ]; then
+        echo "${txtred}[e] Missing directory consul/consulc$i after forming!${txtrst}";
+        exit 1
+    fi
+    if ! [ -d "./flavors/consul/vault/vault$i" ]; then
+        echo "${txtred}[e] Missing directory consul/vault$i after forming!${txtrst}";
+        exit 1
+    fi
+done
+
+if [ ! -f "./flavors/consul/tfstate/terraform.tfstate" ]; then
+    echo "${txtred}[e] No Terraform state generated after forming:${txtrst}"
+    echo "${txtred}tfstate/terraform.tfstate${txtrst}"
+    exit 1
+fi
+
+if [ ! -d "./flavors/consul/.terraform" ]; then
+    echo "${txtred}[e] No Terraform configuration directory after forming:${txtrst}"
+    echo "${txtred}.terraform${txtrst}"
+    exit 1
+fi
+
+for l in init plan apply; do
+    if [ -z "$(find ./flavors/consul/log -type f -name "tf-*-$l.log")" ]; then
+        echo "${txtred}[e] Should be at least one log file of the form:${txtrst}"
+        echo "${txtred}log/tf-*-$l.log${txtrst}"
+        exit 1
+    fi
+done
+
+if ! . ./ion_darts; then
+    echo "${txtred}[e] Error sourcing Ion Darts!${txtrst}"
+    exit 1
+fi
+
+if ! ./blazing_sword; then
+    echo "${txtred}[e] Error forming Blazing Sword!${txtrst}"
+    exit 1
+fi
+
+if ! ./unform; then
+    echo "${txtred}[e] Error unforming any previous Vaultron!${txtrst}"
+    exit 1
+fi
+
+if [ -f "./flavors/consul/tfstate/terraform.tfstate" ]; then
+    echo "${txtred}[e] Terraform state file still present after unforming!${txtrst}"
+    exit 1
+fi
+
+for i in 0 1 2; do
+    if [ -d "./flavors/consul/consul/consuls$i" ]; then
+        echo "${txtred}[e] Directory consul/consuls$i still present after unforming!${txtrst}"
+        exit 1
+    fi
+    if [ -d "./flavors/consul/consul/consulc$i" ]; then
+        echo "${txtred}[e] Directory consul/consulc$i still present after unforming!${txtrst}"
+        exit 1
+    fi
+    if [ -d "./flavors/consul/vault/vault$i" ]; then
+        echo "${txtred}[e] Directory consul/vault$i still present after unforming!${txtrst}"
+        exit 1
+    fi
+done
+
+if [ -z "$(find ./flavors/consul/log -type f -name "tf-*-destroy.log")" ]; then
+    echo "${txtred}[e] Should be at least one log file after destroy of the form:${txtrst}"
+    echo "${txtred}./flavors/consul/log/tf-*-destroy.log${txtrst}"
+    exit 1
+fi

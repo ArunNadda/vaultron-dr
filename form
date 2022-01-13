@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# =======================================================================
+# This script is used to form Vaultron with Terraform
+#
+# Some of these would work only for pure POSIX
+# shellcheck disable=SC1091,SC2059,SC2154
+# =======================================================================
+
+. ./skydome
+
+begin="$(date +%s)"
+
+if [ ! -d "$VAULTRON_TMP" ]
+  then
+    if ! mkdir -p "$VAULTRON_TMP" 2>/dev/null
+      then
+        msg alert "Vaultron cannot form- cannot create temporary directory: $VAULTRON_TMP!"
+        exit 1
+    fi
+fi
+
+form_message_consul() {
+cat << 'EOF'
+
+The Vault UI is available at https://localhost:9200
+
+The Consul UI is available at https://localhost:8500
+
+You can also interact with vault and consul CLI commands after
+exporting the following environment variables in your shell:
+
+export CONSUL_HTTP_ADDR="127.0.0.1:8500"
+export CONSUL_HTTP_SSL=true
+export VAULT_ADDR="https://127.0.0.1:9200"
+export CONSUL_HTTP_TOKEN="b4c0ffee-3b77-04af-36d6-738b697872e6"
+
+or use this command to do it for you:
+
+. ./ion_darts
+EOF
+}
+
+form_message_raft() {
+cat << 'EOF'
+
+The Vault UI is available at https://localhost:9200
+
+You can also interact with vault CLI command after
+exporting the following environment variable in your shell:
+
+export VAULT_ADDR="https://127.0.0.1:9200"
+
+or use this command to do it for you:
+
+. ./ion_darts
+EOF
+}
+
+check_instance_count() {
+  # The rules:
+  #
+  # | Flavor | Valid Vault count | Valid Consul count |
+  # |--------|-------------------|--------------------|
+  # | Consul |        3          |         3          |
+  # |--------|-------------------|--------------------|
+  # | Raft   |        5          |         0          |
+  # |--------|-------------------|--------------------|
+  #
+  case "$TF_VAR_vault_flavor" in
+          consul)
+              export TF_VAR_consul_oss_instance_count=3
+              if [ -n "$TF_VAR_vault_custom_instance_count" ]
+                then
+                  if [ "$TF_VAR_vault_custom_instance_count" != "0" ]
+                    then
+                      export TF_VAR_vault_custom_instance_count=3 \
+                             TF_VAR_vault_oss_instance_count=0 \
+                             TF_VAR_vault_is_custom=1
+                    else
+                      export TF_VAR_vault_custom_instance_count=0 \
+                             TF_VAR_vault_oss_instance_count=3 \
+                             TF_VAR_vault_is_custom=0
+                  fi
+              fi
+              ;;
+
+          raft)
+              export TF_VAR_consul_oss_instance_count=0
+              if [ -n "$TF_VAR_vault_custom_instance_count" ]
+                then
+                  if [ "$TF_VAR_vault_custom_instance_count" = "0" ]
+                    then
+                      export TF_VAR_vault_custom_instance_count=0 \
+                             TF_VAR_vault_oss_instance_count=5 \
+                             TF_VAR_vault_is_custom=1
+                    else
+                      export TF_VAR_vault_custom_instance_count=5 \
+                             TF_VAR_vault_oss_instance_count=0 \
+                             TF_VAR_vault_is_custom=0
+                  fi
+              fi
+              ;;
+          *)
+              msg alert "Bad flavor: $1"
+              exit 1
+  esac
+}
+
+# Check for vault file in project directory
+check_existing_vault() {
+  if [ -f "$PWD"/vault ]
+    then
+      msg alert "Vaultron cannot form- there is a 'vault' file in the present working directory, but this is not allowed!"
+      msg info "Please remove the existing 'vault' before forming Vaultron."
+      exit 1
+  fi
+}
+
+# Check for existing Vaultron private network and create if missing
+check_and_create_vaultron_private_network() {
+if ! docker network ls | grep vaultron-network >> "$VAULTRON_LIFECYCLE_LOG" 2>&1
+  then
+    msg notice "vaultron-network not present- creating ..."
+    if ! docker network create --attachable  --subnet "10.10.42.0/24" vaultron-network >> "$VAULTRON_LIFECYCLE_LOG" 2>&1
+      then
+        msg alert "Cannot create vaultron-network- Vaultron cannot form without private network!"
+        exit 1
+    fi
+  msg success "Created attachable vaultron-network with subnet 10.10.42.0/24"
+fi
+}
+
+# Check for existing Vaultron containers
+check_existing_vaultron_containers() {
+  if docker ps -a | grep 'vaultron-{vault,consul}' >> "$VAULTRON_LIFECYCLE_LOG" 2>&1
+    then
+      msg alert "Vaultron cannot form- there are Vaultron specific Vault or Consul containers currently running or stopped"
+      msg info "Please unform existing Vaultron or use docker stop and docker rm to manually"
+      msg info "clean up the containers shown here:"
+      echo
+      docker ps -a -f name=vaultron --format "table {{.Names}}\t{{.Status}}"
+      exit 1
+  fi
+}
+
+check_consul_version() {
+  if [ -n "$TF_VAR_consul_version" ]
+    then
+      USER_CONSUL_CONFIG="../../red_lion/templates/oss/consul_oss_server_config_${TF_VAR_consul_version}.hcl"
+      if [ ! -f "$USER_CONSUL_CONFIG" ]
+        then
+          msg alert "Vaultron cannot form- sorry, Vaultron does not support Consul version ${TF_VAR_consul_version}!"
+          unset TF_VAR_consul_version
+          kill -INT $$
+      fi
+  fi
+}
+
+check_telemetry() {
+  if [ -z "$TF_VAR_vaultron_telemetry_count" ]
+    then
+      TF_VAR_vaultron_telemetry_count=0
+  fi
+
+  if [ "$TF_VAR_vaultron_telemetry_count" -gt 1 ]
+    then
+      msg alert "Vaultron cannot form- TF_VAR_vaultron_telemetry_count value cannot be greater than one!"
+      exit 1
+  fi
+}
+
+check_vault_version() {
+  if [ -n "$TF_VAR_vault_version" ]
+    then
+      USER_VAULT_CONFIG="../../black_lion/templates/oss/vault_config_${TF_VAR_vault_version}.hcl"
+      if [ ! -f "$USER_VAULT_CONFIG" ]
+        then
+          msg alert "Vaultron cannot form- sorry, Vaultron does not support Vault version ${TF_VAR_vault_version}!"
+          unset TF_VAR_vault_version
+          kill -INT $$
+      fi
+  fi
+}
+
+check_custom_binary() {
+  if [ -n "$TF_VAR_vault_custom_instance_count" ]
+    then
+      if [ "$TF_VAR_vault_custom_instance_count" -gt 0 ]
+        then
+          if [ ! -f ./custom/"$1" ]
+            then
+              msg alert "Vaultron cannot form- custom binary specified, but ./custom/$1 was not found!"
+              exit 1
+          fi
+          if [ -z "$TF_VAR_vault_license" ]
+            then
+              msg notice "Custom binary specified but no Vault license set"
+              msg info "Set license string as value of TF_VAR_vault_license environment variable if you are using an Enterprise binary."
+          fi
+      fi
+  fi
+}
+
+check_required_binaries() {
+  if [ -z "$(command -v vault)" ]
+    then
+      msg alert "Vaultron cannot form- could not locate vault command in PATH!"
+      msg info "Get Vault from: https://www.vaultproject.io/downloads.html"
+      exit 1
+  fi
+  if [ "$TF_VAR_vault_flavor" != "raft" ]
+    then
+      if [ -z "$(command -v consul)" ]
+        then
+          msg alert "Vaultron cannot form- could not locate consul command in PATH!"
+          msg info "Get Consul from: https://www.consul.io/downloads.html"
+         exit 1
+    fi
+  fi
+  if [ -z "$(command -v terraform)" ]
+    then
+      msg alert "Vaultron cannot form- could not locate terraform command in PATH!"
+      msg info "Get Terraform from: https://www.terraform.io/downloads.html"
+      exit 1
+  fi
+}
+
+check_raft_version() {
+# Need > 1.4.0 for Raft storage ... presume latest version if empty value
+  if [ -n "$TF_VAR_vault_version" ]
+    then
+      MINIMUM_RAFT_VERSION="1.4.0"
+      LOWEST_VAULT_VERSION=$(printf "$TF_VAR_vault_version\n$MINIMUM_RAFT_VERSION" \
+                         | sort -t "." -n -k1,1 -k2,2 -k3,3 -k4,4 \
+                         | head -n 1)
+    if [ "$LOWEST_VAULT_VERSION" != "$MINIMUM_RAFT_VERSION" ]
+      then
+        msg alert "Vault version $TF_VAR_vault_version does not support the Integrated Storage backend. (need version $MINIMUM_RAFT_VERSION+)"
+        msg info "Please export 'TF_VAR_vault_version' with a value of 1.4.0 or higher."
+        exit 1
+    fi
+
+    if [ "$TF_VAR_vault_flavor" = "raft" ]
+      then
+        if [ "$TF_VAR_vault_custom_instance_count" = 0 ]
+          then
+            if [ "$TF_VAR_vault_oss_instance_count" != 5 ]
+              then
+                export TF_VAR_vault_oss_instance_count=5
+            fi
+        fi
+    if [ "$TF_VAR_vault_oss_instance_count" = 0 ]
+      then
+        if [ "$TF_VAR_vault_custom_instance_count" != 5 ]
+          then
+            export TF_VAR_vault_custom_instance_count=5
+        fi
+      fi
+    fi
+  fi
+}
+
+# -----------------------------------------------------------------------
+# Preflight checks
+# -----------------------------------------------------------------------
+
+check_flavor
+check_instance_count "$TF_VAR_vault_flavor"
+# msg debug "Instance count retrieved is: OSS: $TF_VAR_vault_oss_instance_count / Custom: $TF_VAR_vault_custom_instance_count"
+check_raft_version
+check_telemetry
+if [ "$(check_katacoda)" = "0" ]
+  then
+    check_docker
+fi
+check_and_create_vaultron_private_network
+check_custom_binary vault
+check_required_binaries
+check_existing_vaultron_containers
+check_existing_vault
+
+# -----------------------------------------------------------------------
+# DO IT.
+# -----------------------------------------------------------------------
+
+# SAVOR THE FLAVOR!
+cd "flavors/$TF_VAR_vault_flavor" || msg alert "This should not be!"
+
+# TerraFORM Vaultron!
+msg greeting "Form Vaultron!"
+
+tflogdir
+
+if ! init
+  then
+    msg alert "Vaultron cannot form- here is the terraform init output from $init_out:"
+    cat "$init_out"
+    exit 1
+fi
+
+if [ "$TF_VAR_vault_flavor" = "consul" ]
+  then
+    CURRENT_CONSUL_VERSION="$(echo "var.consul_version" | terraform console | sed 's/"//g')"
+    export TF_VAR_consul_version=${TF_VAR_consul_version:-$CURRENT_CONSUL_VERSION}
+fi
+
+CURRENT_VAULT_VERSION="$(echo "var.vault_version" | terraform console | sed 's/"//g')"
+export TF_VAR_vault_version=${TF_VAR_vault_version:-$CURRENT_VAULT_VERSION}
+
+check_vault_version
+
+if [ -n "$TF_VAR_vault_custom_instance_count" ]
+  then
+    if [ "$TF_VAR_vault_flavor" = "consul" ]
+      then
+        check_consul_version
+    fi
+fi
+
+if [ -n "$TF_VAR_vault_custom_instance_count" ] && [ "$TF_VAR_vault_custom_instance_count" -gt 0 ]
+  then
+    # we won't be needing this...
+    unset TF_VAR_vault_version
+    msg notice "Vault version: custom binary"
+else
+  msg info "Vault OSS version: ${TF_VAR_vault_version}"
+fi
+
+if [ "$TF_VAR_vault_flavor" = "raft" ]
+  then
+    msg info "Vault flavor: Integrated storage backed"
+  else
+    msg info "Vault flavor: Consul storage backed"
+fi
+
+if [ "$TF_VAR_vault_flavor" = "consul" ]
+  then
+    if [ -n "$TF_VAR_consul_custom" ]
+      then
+        if [ "$TF_VAR_consul_custom" -gt 0 ]
+          then
+            msg info "Consul version: custom binary"
+          else
+            msg info "Consul OSS version: ${TF_VAR_consul_version}"
+        fi
+      else
+        msg info "Consul OSS version: ${TF_VAR_consul_version}"
+    fi
+fi
+
+plan_file=./tfstate/vaultron-$(date -u "+%Y-%m-%dT%H:%M:%SZ").plan
+
+if ! plan "${plan_file}"
+  then
+    msg alert "Vaultron cannot form- here is the terraform plan output from $plan_out:"
+    cat "$plan_out"
+    exit 1
+fi
+
+if ! apply "${plan_file}"
+  then
+    msg alert "Vaultron cannot form- here is the terraform apply output from $apply_out:"
+    cat "$apply_out"
+    exit 1
+fi
+
+rm -f "${plan_file}"
+
+end="$(date +%s)"
+runtime=$((end-begin))
+
+msg success "Vaultron formed in ${runtime}s."
+tput setaf 7
+if [ "$TF_VAR_vault_flavor" = "raft" ]
+  then
+    form_message_raft
+  else
+    form_message_consul
+fi
+
+tput sgr0
+
+cd ../..

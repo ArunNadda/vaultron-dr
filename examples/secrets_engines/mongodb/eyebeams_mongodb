@@ -1,0 +1,92 @@
+#!/bin/sh
+#
+# This script is used to setup a MongoDB Docker container
+# for Vaultron secret engine use
+#
+# shellcheck disable=SC1090,SC1091,SC2059
+
+HERE="$(pwd)"
+SKYDOME="$(while [ "$HERE" != "/" ] ; do HERE=$(dirname "$HERE"); find "$HERE" -maxdepth 1 -name skydome; done)"
+if [ -z "$SKYDOME" ]; then
+  SKYDOME=./skydome
+fi
+. $SKYDOME
+
+check_cli_cap
+if [ "$VAULT_CLI_CAP" -eq "1" ]; then
+    SECRETS_LIST_CMD="vault secrets list"
+    SECRETS_ENABLE_CMD="vault secrets enable"
+  else
+    SECRETS_LIST_CMD="vault mounts"
+    SECRETS_ENABLE_CMD="vault mount"
+fi
+
+msg greeting "Engage Eye Beams for MongoDB! ..."
+
+run_docker_container() {
+  msg info "Run MongoDB Docker container ..."
+  docker run \
+    --detach \
+    --rm \
+    --ip 10.10.42.222 \
+    --name vaultron-mongodb \
+    --network vaultron-network \
+    -p 27017:27017 \
+    mongo > /dev/null 2>&1
+}
+
+if ! docker ps -a | grep vaultron-mongodb > /dev/null 2>&1; then
+  if ! run_docker_container; then
+    msg alert "Problem Starting MongoDB Docker container!"
+    exit 1
+  else
+    msg complete "MongoDB Docker container running!"
+    msg info "$(docker ps -f name=vaultron-mongodb --format "table {{.Names}}\t{{.Status}}"| tail -n +2)"
+  fi
+fi
+
+MONGODB_CONTAINER_IP="$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vaultron-mongodb)"
+
+if ! $SECRETS_LIST_CMD | grep 'vaultron-database' > /dev/null 2>&1; then
+  msg info "Enable Database secrets engine ..."
+  if $SECRETS_ENABLE_CMD -path=vaultron-database database > /dev/null 2>&1; then
+    msg complete "Enabled Database Secrets Engine!"
+  else
+    msg alert "Problem enabling MongoDB database Secrets Engine!"
+    exit 1
+  fi
+fi
+
+# Use vault0 and netcat to determine when
+# the MongoDB container port is open ...
+msg info "Pausing while MongoDB at $MONGODB_CONTAINER_IP wakes up ..."
+MONGODB_READY=1
+while [ "$MONGODB_READY" = "1" ]; do
+  sleep 1; docker exec -it vaultron-vault0 nc -z "$MONGODB_CONTAINER_IP" 27017 ; export MONGODB_READY=$? ;
+done
+
+msg info "Configure MongoDB database Secrets Engine ..."
+if vault write vaultron-database/config/mongodb \
+  plugin_name=mongodb-database-plugin \
+  allowed_roles="vaultron-role" \
+  connection_url="mongodb://$MONGODB_CONTAINER_IP:27017/admin?ssl=false" > /dev/null 2>&1; then
+  msg complete "Configured MongoDB database Secrets Engine!"
+else
+    msg alert "Cannot configure MongoDB database Secrets Engine!"
+    exit 1
+fi
+
+msg info "Configure MongoDB role ..."
+if vault write vaultron-database/roles/vaultron-role \
+  db_name=mongodb \
+  creation_statements='{ "db": "admin", "roles": [{ "role": "readWrite" }, {"role": "read", "db": "foo"}] }' \
+  default_ttl="1h" \
+  max_ttl="24h" > /dev/null 2>&1; then
+  msg complete "Configured MongoDB role!"
+else
+    msg alert "Cannot configure MongoDB vaultron-role role"
+    exit 1
+fi
+
+msg complete "MongoDB database Secrets Engine enabled! Use the following command to get a MongoDB user credential:"
+msg complete "vault read vaultron-database/creds/vaultron-role"

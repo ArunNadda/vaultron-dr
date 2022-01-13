@@ -1,0 +1,337 @@
+#!/bin/sh
+# =======================================================================
+#           ‼️ PLEASE DO NOT USE VAULTRON IN PRODUCTION ‼️
+#
+# blazing_sword
+#
+# Automatically starts and pre-populates Vault cluster for use in development
+# or other evaluation style use cases:
+#
+# - Initialize Vault
+# - Save key material to temporary file
+# - Unseal Vault with key material from temporary file
+# - Enable a range of auth methods and secrets engines with a vaultron prefix
+#   with blazing_sword Terraform configuration
+#   (see examples/terraform for the configuration used)
+#
+# shellcheck disable=SC1091,SC2039,SC2059,SC2086,SC2154
+# =======================================================================
+
+. ./skydome
+
+export MSGSRC="[blazing_sword]"
+
+begin="$(date +%s)"
+
+# Check for the existence of a temporary key material file
+check_vault_file() {
+  for file in "$TF_VAR_vault_flavor"/vault/vault_*.tmp
+    do
+      if [ -e "$file" ]
+        then
+          msg info "Existing Vault file detected- pass filename as first argument and it will be used for unsealing."
+          exit 0
+      fi
+    done
+}
+
+# Authenticate with initial root token
+auth_root() {
+  check_cli_cap
+  get_initial_root_token "$1"
+  if [ "$VAULT_CLI_CAP" -eq "1" ]
+    then
+      local LOGIN_CMD="vault login $INITIAL_ROOT_TOKEN"
+    else
+      local LOGIN_CMD="vault auth $INITIAL_ROOT_TOKEN"
+  fi
+  msg info "Authenticate with initial root token ..."
+  if ! $LOGIN_CMD >> "$VAULTRON_LIFECYCLE_LOG" 2>&1
+    then
+      msg alert "Could not authenticate with initial root token!"
+      exit 1
+    else
+      msg success "Authenticated with initial root token!"
+  fi
+}
+
+# Enable all the things
+enable_all() {
+  msg info "Enable audit device, auth methods, secrets engines, and policies ..."
+  cd examples/terraform || exit 1
+  {
+    rm -rf .terraform
+    rm -f terraform.tfstate
+    rm -f vault.plan >> "$VAULTRON_LIFECYCLE_LOG" 2>&1
+  }
+  terraform init >> "$VAULTRON_LIFECYCLE_LOG" 2>&1 && \
+  terraform plan -out vault.plan >> "$VAULTRON_LIFECYCLE_LOG" 2>&1 && \
+  terraform apply "vault.plan" >> "$VAULTRON_LIFECYCLE_LOG" 2>&1
+  msg success "Audit device, auth methods, secrets engines, and policies enabled!"
+}
+
+# List enabled auth methods and secrets engines
+enabled() {
+  echo
+  msg info "Enabled Auth Methods:"
+  echo
+  check_cli_cap
+  if [ "$VAULT_CLI_CAP" -eq "1" ]
+    then
+      AUTH_LIST_CMD="vault auth list"
+    else
+      AUTH_LIST_CMD="vault auth -methods"
+  fi
+  if [ "$VAULT_CLI_CAP" -eq "1" ]
+    then
+      SECRETS_LIST_CMD="vault secrets list"
+    else
+      SECRETS_LIST_CMD="vault mounts"
+  fi
+  $AUTH_LIST_CMD
+  echo
+  msg info "Enabled Secrets Engines:"
+  echo
+  $SECRETS_LIST_CMD
+  echo
+  tput setaf 0
+}
+
+# Get unseal key
+get_unseal_key() {
+  msg info "Get unseal key ..."
+  k0=$(grep 'Unseal Key 1' "$1" | awk '{print $NF}')
+}
+
+# Get initial root token
+get_initial_root_token() {
+  INITIAL_ROOT_TOKEN=$(grep 'Initial Root Token' "$1" | awk '{print $NF}')
+}
+
+# Initialize Vault and save temporary unseal keys and root token
+initialize_vault() {
+  check_cli_cap
+  if [ "$VAULT_CLI_CAP" -eq "1" ]
+    then
+      local INIT_CMD="vault operator init -key-shares=1  -key-threshold=1"
+    else
+      local INIT_CMD="vault init -key-shares=1  -key-threshold=1"
+  fi
+  msg info "Initialize Vault ..."
+  # Tidy control characters from initialization output before writing
+  if output="$($INIT_CMD)"
+    then
+      echo "$output" | awk '{gsub(/\033\[[0-9]+m/,""); print}' > "${VAULT_DAT}"
+    else
+      msg alert "Cannot initialize Vault!"
+      msg alert "$output"
+      exit 1
+  fi
+   msg complete "Vault initialized!"
+}
+
+# Initialize Vault Raft standby and save temporary unseal keys and root token
+initialize_vault_raft_standby() {
+  local VAULT_ADDR="https://127.0.0.1:92${1}0"
+  local INIT_CMD="vault operator init -key-shares 1 -key-threshold 1"
+  msg info "Initialize Vault ..."
+  # Tidy control characters from initialization output before writing
+  if output="$($INIT_CMD)"
+    then
+      echo "$output" | awk '{gsub(/\033\[[0-9]+m/,""); print}' > "$2"
+    else
+      msg alert "Cannot initialize Vault!"
+      msg alert "$output"
+    exit 1
+  fi
+   msg complete "Vault initialized!"
+}
+
+# Get Vault status
+status() {
+  msg info "Vault status:"
+  printf "\\n%s" "$(vault status)"
+  printf "\\n"
+}
+
+# Note about statsd server for Telemetry
+telemetry_info() {
+  if VSTATSD_ADDR=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vaultron-vstatsd) >> "$VAULTRON_LIFECYCLE_LOG" 2>&1; then
+    msg info "Telemetry: statsd address: $VSTATSD_ADDR"
+  else
+    msg alert "Cannot determine statsd address!"
+  fi
+}
+
+# Consul leader container info
+consul_leader_info() {
+  if CONSUL_LEADER_ADDR=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vaultron-consuls0) >> "$VAULTRON_LIFECYCLE_LOG" 2>&1; then
+    msg info "Consul leader address: $CONSUL_LEADER_ADDR"
+  else
+    msg alert "Cannot determine Consul leader address!"
+  fi
+}
+
+# Initial Vault active container info
+vault_active_info() {
+  if VAULT_ACTIVE_ADDR=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' vaultron-vault0) >> "$VAULTRON_LIFECYCLE_LOG" 2>&1; then
+    msg info "Active Vault address: $VAULT_ACTIVE_ADDR"
+  else
+    msg alert "Cannot determine active Vault address!"
+  fi
+}
+
+# Unseal Vault (with Consul storage)
+unseal_vault_consul() {
+  check_cli_cap
+  if [ "$VAULT_CLI_CAP" -eq "1" ]; then
+    local UNSEAL_CMD="vault operator unseal"
+  else
+    local UNSEAL_CMD="vault unseal"
+  fi
+  msg info "Unseal Vault ..."
+  get_unseal_key $VAULT_DAT
+  if ! VAULT_ADDR="https://localhost:9200" \
+    $UNSEAL_CMD "$k0" >> "$VAULTRON_LIFECYCLE_LOG" 2>&1; then
+    msg alert "Cannot unseal Vault 1!"
+    errors=$((errors + $?))
+    exit $errors
+  fi
+  if ! VAULT_ADDR="https://localhost:9210" \
+    $UNSEAL_CMD "$k0" >> "$VAULTRON_LIFECYCLE_LOG" 2>&1; then
+    msg alert "Cannot unseal Vault 2!"
+    errors=$((errors + $?))
+    exit $errors
+  fi
+  if ! VAULT_ADDR="https://localhost:9220" \
+    $UNSEAL_CMD "$k0" >> "$VAULTRON_LIFECYCLE_LOG" 2>&1; then
+    msg alert "Cannot unseal Vault 3!"
+    errors=$((errors + $?))
+    exit $errors
+  fi
+  msg complete "Vault unsealed!"
+}
+
+# Join Raft primary
+join_raft_primary() {
+  msg info "Raft flavored storage: Join ${1} to primary ..."
+  get_initial_root_token $VAULT_DAT
+  if ! VAULT_ADDR="https://127.0.0.1:92${1}0" VAULT_TOKEN="$INITIAL_ROOT_TOKEN" vault operator raft join $VAULT_RAFT_PRIMARY_ADDR; then
+    msg alert "Cannot join Vault ${1}!"
+    errors=$((errors + $?))
+    exit $errors
+  fi
+  msg complete "Raft flavored storage: Joined ${1} to primary!"
+}
+
+# Unseal Vault (with raft storage)
+unseal_vault_raft() {
+  msg info "Unseal Vault ${1} ..."
+  get_unseal_key $VAULT_DAT
+  if ! VAULT_ADDR="https://localhost:92${1}0" \
+    vault operator unseal "$k0" >> "$VAULTRON_LIFECYCLE_LOG" 2>&1; then
+    msg alert "Cannot unseal Vault!"
+    errors=$((errors + $?))
+    exit $errors
+  fi
+  msg complete "Vault unsealed!"
+}
+
+msg greeting "Blazing Sword!"
+
+sleep 2s
+
+check_flavor
+
+VAULT_DAT="$PWD/flavors/$TF_VAR_vault_flavor/vault/vault_DEV_ONLY-$(date +%s).tmp"
+VAULT_RAFT_PRIMARY_ADDR=https://10.10.42.220:8200
+
+check_vault
+
+# Ain't nobody got time for your stale token!
+unset VAULT_TOKEN
+
+# -----------------------------------------------------------------------
+# Consul storage flavor
+# -----------------------------------------------------------------------
+
+if [ "$TF_VAR_vault_flavor" = "consul" ]; then
+  initialize_vault 0
+  unseal_vault_consul
+  auth_root "${VAULT_DAT}"
+  enable_all
+  status
+  enabled
+  vault_active_info
+  consul_leader_info
+fi
+
+# -----------------------------------------------------------------------
+# Raft storage flavor
+# -----------------------------------------------------------------------
+
+if [ "$TF_VAR_vault_flavor" = "raft" ]; then
+  initialize_vault 0
+  unseal_vault_raft 0
+  msg info "Await Vault post unseal setup (10 seconds) ..."
+  sleep 10s
+
+  join_raft_primary 1
+  msg info "Raft flavored storage: Unseal Vault 1 ..."
+  if ! unseal_vault_raft 1; then
+    msg alert "Cannot unseal Vault 1!"
+    errors=$((errors + $?))
+    exit $errors
+  fi
+
+  join_raft_primary 2
+  msg info "Raft flavored storage: Unseal Vault 2 ..."
+  if ! unseal_vault_raft 2; then
+    msg alert "Cannot unseal Vault 2!"
+    errors=$((errors + $?))
+    exit $errors
+  fi
+
+  join_raft_primary 3
+  msg info "Raft flavored storage: Unseal Vault 3 ..."
+  if ! unseal_vault_raft 3; then
+    msg alert "Cannot unseal Vault 3!"
+    errors=$((errors + $?))
+    exit $errors
+  fi
+
+  join_raft_primary 4
+  msg info "Raft flavored storage: Unseal Vault 4 ..."
+  if ! unseal_vault_raft 4; then
+    msg alert "Cannot unseal Vault 4!"
+    errors=$((errors + $?))
+    exit $errors
+  fi
+
+  auth_root "${VAULT_DAT}"
+  enable_all
+  status
+  enabled
+  vault_active_info
+  msg info "Current cluster status:"
+  echo
+  vault operator raft list-peers
+fi
+
+if [ "$TF_VAR_vaultron_telemetry_count" = "1" ]; then
+  telemetry_info
+fi
+
+end="$(date +%s)"
+runtime=$((end-begin))
+
+echo
+msg success "Blazing sword complete in ${runtime}s."
+
+# -----------------------------------------------------------------------
+# Fin
+# -----------------------------------------------------------------------
+
+unset VAULT_TOKEN
+
+tput sgr0
